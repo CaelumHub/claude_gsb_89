@@ -15,7 +15,7 @@
         <div class="page-head">
           <div>
             <h1>个性化推荐</h1>
-            <p class="desc">融合协同过滤、图嵌入与标签信号，经 MMR 多样性重排序；冷启动用户自动退化为热门 + 标签推荐。</p>
+            <p class="desc">融合协同过滤、图嵌入与标签信号，经 MMR 多样性重排序；冷启动用户自动退化为热门 + 标签推荐。每条推荐附带从真实图数据生成的可读理由：共同好友、标签重合、同社群或结构位置相似，依据可点开关系链核验。</p>
           </div>
         </div>
 
@@ -72,30 +72,100 @@
   <script>
     const C = common;
 
-    function reasonBadge(reason) {
+    // 证据类型 -> 徽章配色（与后端 reasons.py 的证据类型一一对应）
+    const EV_STYLE = {
+      common_friends: "brand",
+      shared_tags: "success",
+      same_community: "info",
+      structural_similar: "warning",
+      popularity: "",
+    };
+
+    // 旧字段 reason（信号来源名）保留展示；主理由用 explanation.primary_label
+    function signalBadge(reason) {
       const map = { "协同过滤": "brand", "图嵌入": "info", "标签": "success", "热门": "warning" };
-      return '<span class="badge ' + (map[reason] || "") + '">' + reason + "</span>";
+      return reason ? '<span class="badge ' + (map[reason] || "") + '">信号 · ' + C.escapeHtml(reason) + "</span>" : "";
+    }
+
+    // 渲染一条证据的徽章（带数值摘要）
+    function evidenceChip(ev) {
+      let detail = "";
+      if (ev.type === "common_friends") detail = ev.count + " 位";
+      else if (ev.type === "shared_tags") detail = ev.overlap + " 个标签";
+      else if (ev.type === "same_community") detail = "社群 " + ev.community_id;
+      else if (ev.type === "structural_similar") detail = "余弦 " + ev.embedding_cosine;
+      else if (ev.type === "popularity") detail = "排名 " + ev.rank + "/" + ev.total;
+      return '<span class="badge ev-chip ' + (EV_STYLE[ev.type] || "") + '" title="' +
+        C.escapeHtml(ev.label) + '">◈ ' + C.escapeHtml(ev.label) +
+        (detail ? " · " + C.escapeHtml(detail) : "") + "</span>";
+    }
+
+    // 共同好友关系链：你 → 共同好友 → 候选
+    function renderChain(uid, it, commonEv) {
+      if (!commonEv || !commonEv.chains || !commonEv.chains.length) return "";
+      const chains = commonEv.chains.slice(0, 3);
+      const links = chains.map((chain, i) => {
+        const bridge = chain[1];
+        const meta = commonEv.shared_friends.find((f) => f.id === bridge);
+        const name = meta ? meta.name : String(bridge);
+        return '<span class="reason-chain">' +
+          '<span class="chain-node is-me">我 #' + uid + "</span>" +
+          '<span class="chain-arrow">→</span>' +
+          '<span class="chain-node">' + C.escapeHtml(name) + " <span class=\"mono faint small\">#" + bridge + "</span></span>" +
+          '<span class="chain-arrow">→</span>' +
+          '<span class="chain-node is-cand">' + C.escapeHtml(it.name || String(it.id)) + " <span class=\"mono faint small\">#" + it.id + "</span></span>" +
+          "</span>";
+      }).join("");
+      const more = commonEv.count > chains.length
+        ? '<span class="faint small">等 ' + commonEv.count + " 位共同好友</span>"
+        : '<a class="chain-link" href="path.html?source=' + uid + "&target=" + it.id + '">在路径页核验 →</a>';
+      return '<div class="reason-evidence"><span class="evidence-cap">关系链</span>' +
+        '<div class="reason-chains">' + links + more + "</div></div>";
+    }
+
+    // 标签重合明细
+    function renderTags(ev) {
+      if (!ev || !ev.shared_tags.length) return "";
+      const tags = ev.shared_tags.map((t) => '<span class="tag">🏷 ' + C.escapeHtml(t) + "</span>").join(" ");
+      return '<div class="reason-evidence"><span class="evidence-cap">共同标签 ' +
+        ev.overlap + "/" + ev.user_tag_count + "</span><div>" + tags + "</div></div>";
     }
 
     function renderRec(r) {
       const badges = document.getElementById("recBadges");
       badges.innerHTML =
-        '<span class="badge brand">策略 ' + r.strategy + "</span>" +
+        '<span class="badge brand">策略 ' + C.escapeHtml(r.strategy) + "</span>" +
         (r.cold_start ? '<span class="badge warning">❄ 冷启动</span>' : '<span class="badge success">正常</span>') +
         '<span class="badge">好友数 ' + r.degree + "</span>" +
         '<span class="badge info">多样性 λ=' + r.diversity + "</span>" +
-        (r.cached ? '<span class="badge">缓存命中</span>' : '<span class="badge success">实时计算 ' + r.time_ms.toFixed(1) + " ms</span>");
+        (r.cached ? '<span class="badge">缓存命中（理由复用）</span>' : '<span class="badge success">实时计算 ' + r.time_ms.toFixed(1) + " ms</span>");
 
       const box = document.getElementById("recList");
       if (!r.items.length) { box.innerHTML = C.emptyState("✦", "无可推荐对象（图可能太小或该用户已与所有人相连）"); return; }
-      box.innerHTML = r.items.map((it, i) =>
-        '<div class="rec-item">' +
-        '<div class="rec-rank' + (i < 3 ? " top" : "") + '">' + (i + 1) + "</div>" +
-        '<div class="rec-info"><div class="name">' + C.escapeHtml(it.name || ("用户 " + it.id)) + ' <span class="faint mono small">#' + it.id + "</span></div>" +
-        '<div class="meta">' + reasonBadge(it.reason) + "</div></div>" +
-        '<div class="rec-score">' + it.score.toFixed(4) + "</div>" +
-        "</div>"
-      ).join("");
+      box.innerHTML = r.items.map((it, i) => {
+        const ex = it.explanation;
+        const evidences = ex ? ex.evidence : [];
+        const commonEv = evidences.find((e) => e.type === "common_friends");
+        const tagsEv = evidences.find((e) => e.type === "shared_tags");
+        // 主理由：后端生成的完整可读句子；无解释数据时兜底旧字段
+        const reasonText = ex ? ex.reason_text : ("推荐信号：" + (it.reason || "综合"));
+        return '<div class="rec-item">' +
+          '<div class="rec-rank' + (i < 3 ? " top" : "") + '">' + (i + 1) + "</div>" +
+          '<div class="rec-info">' +
+            '<div class="name">' + C.escapeHtml(it.name || ("用户 " + it.id)) +
+            ' <span class="faint mono small">#' + it.id + "</span></div>" +
+            '<div class="reason-text">💡 ' + C.escapeHtml(reasonText) + "</div>" +
+            '<div class="reason-meta">' +
+              '<span class="badge brand">' + (ex ? C.escapeHtml(ex.primary_label) : "综合") + "</span>" +
+              evidences.map(evidenceChip).join("") +
+              signalBadge(it.reason) +
+            "</div>" +
+            renderTags(tagsEv) +
+            renderChain(r.user, it, commonEv) +
+          "</div>" +
+          '<div class="rec-score">' + it.score.toFixed(4) + "</div>" +
+        "</div>";
+      }).join("");
     }
 
     function recommend(uid, k, strategy) {
@@ -125,9 +195,17 @@
           let html = "";
           for (const uid of ids) {
             const items = results[String(uid)] || [];
-            html += '<div class="card" style="margin-bottom:10px;padding:14px"><strong>用户 ' + uid + "</strong>" +
-                    (items.length ? items.map((it) => '<span class="badge brand" style="margin-left:6px">' + (it.name || it.id) + "</span>").join("") : ' <span class="faint">无</span>') +
-                    "</div>";
+            html += '<div class="card" style="margin-bottom:10px;padding:14px"><strong>用户 ' + uid + "</strong>";
+            if (!items.length) {
+              html += ' <span class="faint">无推荐</span>';
+            } else {
+              html += '<div class="batch-reasons">' + items.map((it) =>
+                '<div class="batch-item"><span class="badge brand">' +
+                C.escapeHtml(it.name || String(it.id)) + " #" + it.id + "</span>" +
+                '<span class="faint small">' + C.escapeHtml(it.reason_text || it.reason || "") + "</span></div>"
+              ).join("") + "</div>";
+            }
+            html += "</div>";
           }
           box.innerHTML = html;
         }).catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });

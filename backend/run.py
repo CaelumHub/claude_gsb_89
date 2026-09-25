@@ -57,7 +57,25 @@ def _check() -> int:
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    # Recommendation explanations: evidence must match the real graph.
+    from backend.reasons import RecommendationExplainer, TYPE_COMMON_FRIENDS
+
+    users = {n: {"name": f"u{n}", "tags": ["t"] if n in (1, 4, 5) else []} for n in g.nodes}
+    explainer = RecommendationExplainer(g, users)
+    # Nodes 1 and 4 share friend 3 across the bridge (clique -- 3 -- clique).
+    ex = explainer.explain(1, 4)
+    assert ex["evidence"], "every explanation needs evidence"
+    cf = next(e for e in ex["evidence"] if e["type"] == TYPE_COMMON_FRIENDS)
+    assert cf["count"] == len(set(g.neighbors(1)) & set(g.neighbors(4))) == 1
+    assert cf["chains"] and all(len(c) == 3 for c in cf["chains"])
+    assert ex["reason_text"], "readable reason text is required"
+    # All common-friend bridges really sit between the two users.
+    for bridge in cf["shared_friends"]:
+        assert g.has_edge(1, bridge["id"]) and g.has_edge(bridge["id"], 4)
+    # Disjoint nodes still get an honest fallback (never an invented reason).
+    assert explainer.explain(1, 5)["evidence"]
+
+    print("[check] OK: graph, bfs, pagerank, louvain, recommend, reasons all pass")
     return 0
 
 

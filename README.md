@@ -45,6 +45,7 @@ gsb3/
 │   ├── config.py               # 配置、设置存储、路径、原子写工具
 │   ├── graph.py                # 内存高效 CSR 图（邻接表冻结为压缩数组）
 │   ├── algorithms.py           # BFS/双向BFS、PageRank、Louvain、推荐算法
+│   ├── reasons.py              # 推荐理由生成（与推荐计算分离，证据可复用/可核验）
 │   ├── storage.py              # 分片 JSON 邻接表存储、索引、增量合并
 │   ├── service.py              # 业务服务层（缓存、CRUD、算法调度）
 │   ├── api.py                  # HTTP 服务 + REST 路由 + 静态托管
@@ -70,6 +71,7 @@ gsb3/
     ├── profiles.json           # 用户画像（预留扩展）
     ├── tags.json               # 标签体系
     ├── recommendations.json    # 推荐结果（单独存储）
+    ├── reasons.json            # 推荐理由（“用户:候选”粒度，可复用，附数据签名）
     ├── community.json          # Louvain 结果缓存
     ├── pagerank.json           # PageRank 结果缓存
     ├── index.json              # 用户 → 分片 索引
@@ -110,11 +112,32 @@ gsb3/
 | 冷启动 | 好友数低于阈值时退化为「热门 + 标签重叠」 |
 | 多样性 | MMR 最大边际相关性重排序，λ 权衡相关性与多样性 |
 
+### 5. 推荐理由（`reasons.py`，与推荐计算分离）
+
+每条推荐都附带**从真实图数据生成的结构化证据 + 可读中文理由**。理由生成是独立模块：
+推荐器只决定「推荐谁」，`RecommendationExplainer` 只负责解释「为什么」，对任意
+`(目标用户, 候选)` 都可调用，因此同一份依据可被推荐列表、批量推荐与独立的
+`/api/recommend/<id>/why/<candidate>` 查询复用。
+
+证据类型（按展示优先级，均来自当前图快照，零虚构）：
+
+| 证据 | 真实依据 | 页面呈现 |
+| --- | --- | --- |
+| 共同好友 | 两用户邻居集合交集的人（含 `我→共同好友→候选` 关系链） | 人数 + 好友名 + 关系链，可跳转路径页核验 |
+| 标签重合 | 用户档案标签集合的交集（标签名、重合数/本人标签数） | 标签徽章 + 明细 |
+| 同社群 | Louvain 划分中的同一个社群（社群编号、规模） | 证据徽章 |
+| 结构相似 | 地标距离向量余弦（校准样本上分位阈值）+ 度数接近 + 共同二度人脉 | 余弦/度数等真实数值 |
+| 热门拓展 | 候选度数与全站排名百分位（无强信号时的**诚实回退**，不编造关系） | 排名文案 |
+
+**一致性保证**：解释器与推荐器使用同一个冻结图快照；理由以 `(用户:候选)` 粒度缓存到
+`reasons.json` 并带图拓扑/用户标签两份 CRC 签名，图导入、用户改名改标签、社群重算后
+签名/脏标记失效并自动重算；图变更还会同时清空推荐缓存，避免「旧推荐 + 新图理由」。
+
 ### 4. 数据分层
 
-图数据（分片邻接表）与派生数据（`recommendations.json` / `profiles.json` /
-`community.json` / `pagerank.json`）**分开存储**：图变更只触发图分片的增量写与索引
-刷新；推荐与社群结果作为缓存持久化，命中后零计算。
+图数据（分片邻接表）与派生数据（`recommendations.json` / `reasons.json` /
+`profiles.json` / `community.json` / `pagerank.json`）**分开存储**：图变更只触发图分片的
+增量写与索引刷新；推荐、理由与社群结果作为缓存持久化，命中后零计算。
 
 ---
 
@@ -133,7 +156,8 @@ gsb3/
 | GET | `/api/path` · `/api/common-friends` | 最短路径 / 共同好友 |
 | GET/POST | `/api/community` · `/api/community/compute` | Louvain 结果 / 重算 |
 | GET | `/api/pagerank?top=` | PageRank 中心性 |
-| GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐 |
+| GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐（每条含可读理由与证据） |
+| GET | `/api/recommend/<id>/why/<candidate>` | 单独查询某条推荐的可读理由与关系链证据 |
 | GET | `/api/stats` | 统计面板聚合 |
 | GET/PUT | `/api/settings` | 读取 / 保存设置 |
 | GET/POST/DELETE | `/api/tags` | 标签管理 |

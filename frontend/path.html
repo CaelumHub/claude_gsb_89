@@ -146,9 +146,12 @@
       document.getElementById("btnQuery").addEventListener("click", query);
       document.getElementById("src").addEventListener("keyup", (e) => { if (e.key === "Enter") query(); });
       document.getElementById("dst").addEventListener("keyup", (e) => { if (e.key === "Enter") query(); });
-      // 默认示例
-      document.getElementById("src").value = 1;
-      document.getElementById("dst").value = 60;
+      // 默认示例（?source=&target= 可从推荐理由的关系链直接跳转）
+      const params = new URLSearchParams(location.search);
+      const src0 = params.get("source");
+      const dst0 = params.get("target");
+      document.getElementById("src").value = src0 || 1;
+      document.getElementById("dst").value = dst0 || 60;
       query();
     });
   </script>

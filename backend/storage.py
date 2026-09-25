@@ -422,6 +422,35 @@ class DerivedStore:
             config.RECOMMENDATIONS_FILE, {"recs": {str(k): v for k, v in recs.items()}}
         )
 
+    # ---- recommendation reasons (pair-level, reusable explanations) -------
+    def load_reasons(self) -> dict:
+        """Load the reusable reason cache::
+
+            {"graph_sig", "users_sig", "pairs": {"uid:candidate": explanation}}
+
+        Validity of the signatures is checked by the service layer; stale
+        caches simply get discarded and recomputed.
+        """
+        data = config.read_json(config.REASONS_FILE, {})
+        pairs = data.get("pairs", {})
+        if not isinstance(pairs, dict):
+            pairs = {}
+        return {
+            "graph_sig": data.get("graph_sig", ""),
+            "users_sig": data.get("users_sig", ""),
+            "pairs": pairs,
+        }
+
+    def save_reasons(self, graph_sig: str, users_sig: str, pairs: Dict[str, dict]) -> None:
+        config.atomic_write_json(
+            config.REASONS_FILE,
+            {
+                "graph_sig": graph_sig,
+                "users_sig": users_sig,
+                "pairs": pairs,
+            },
+        )
+
     def load_community(self) -> dict:
         data = config.read_json(config.COMMUNITY_FILE, {})
         data.setdefault("communities", {})

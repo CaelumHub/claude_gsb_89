@@ -85,6 +85,8 @@
     // 推荐
     recommend: (id, p) => request("GET", "/api/recommend/" + id + qs(p)),
     recommendMany: (ids, k) => request("POST", "/api/recommend", { ids, k }),
+    recommendWhy: (id, candidateId) =>
+      request("GET", "/api/recommend/" + id + "/why/" + candidateId),
 
     // 统计 / 设置 / 标签
     stats: () => request("GET", "/api/stats"),

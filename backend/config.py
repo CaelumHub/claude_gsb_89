@@ -38,6 +38,7 @@ USERS_FILE = os.path.join(DATA_DIR, "users.json")
 PROFILES_FILE = os.path.join(DATA_DIR, "profiles.json")
 TAGS_FILE = os.path.join(DATA_DIR, "tags.json")
 RECOMMENDATIONS_FILE = os.path.join(DATA_DIR, "recommendations.json")
+REASONS_FILE = os.path.join(DATA_DIR, "reasons.json")
 COMMUNITY_FILE = os.path.join(DATA_DIR, "community.json")
 PAGERANK_FILE = os.path.join(DATA_DIR, "pagerank.json")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
@@ -93,6 +94,9 @@ BFS_MAX_DEPTH = 64                        # safety bound on unweighted BFS
 RECOMMEND_DEFAULT_K = 10
 RECOMMEND_MAX_K = 50
 RECOMMEND_CLAMP_MAX = 5
+# Pair-level explanation cache ("uid:candidate" -> explanation) is reusable
+# across recommendation runs; cap its size so the reasons file stays bounded.
+REASONS_CACHE_MAX_PAIRS = 10_000
 COLD_START_CONNECTION_THRESHOLD = 3
 COLD_START_USE_WEIGHTED_DEGREE = True
 DIVERSITY_LAMBDA = 0.6

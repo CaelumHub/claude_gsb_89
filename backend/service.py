@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from . import algorithms, config, storage
+    from . import algorithms, config, reasons, storage
     from .algorithms import (
         adamic_adar,
         bidirectional_shortest_path,
@@ -36,10 +36,12 @@ try:
         shortest_path,
     )
     from .graph import Graph
+    from .reasons import RecommendationExplainer
     from .storage import DerivedStore, GraphStore, rebuild_index_from_shards
 except ImportError:  # pragma: no cover
     import algorithms
     import config
+    import reasons
     import storage
     from algorithms import (  # type: ignore
         adamic_adar,
@@ -53,6 +55,7 @@ except ImportError:  # pragma: no cover
         shortest_path,
     )
     from graph import Graph
+    from reasons import RecommendationExplainer  # type: ignore
     from storage import DerivedStore, GraphStore, rebuild_index_from_shards
 
 
@@ -74,6 +77,19 @@ class SocialGraphService:
         self._community_dirty = False
         self._pagerank_dirty = False
 
+        # Recommendation-explanation layer (reasons.py), kept separate from the
+        # recommender itself.  Signatures ensure cached evidence only reuses
+        # data that still matches the live graph + tag data.
+        reasons_data = self.derived.load_reasons()
+        self._reason_pairs: Dict[str, dict] = reasons_data["pairs"]
+        self._reason_graph_sig: str = reasons_data["graph_sig"]
+        self._reason_users_sig: str = reasons_data["users_sig"]
+        self._reasons_dirty = False
+        self._graph_sig: Optional[str] = None
+        self._explainer: Optional[RecommendationExplainer] = None
+        self._embedding_cache: Optional[Dict[int, list]] = None
+        self._community_for_reasons: Optional[Dict[int, int]] = None
+
     # ------------------------------------------------------------------
     # Graph access / caching
     # ------------------------------------------------------------------
@@ -86,6 +102,9 @@ class SocialGraphService:
                 # Graph changed -> derived results are stale.
                 self._community_dirty = True
                 self._pagerank_dirty = True
+                self._graph_sig = None
+                self._embedding_cache = None
+                self._explainer = None
             return self._graph
 
     def invalidate_graph(self) -> None:
@@ -94,6 +113,19 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+            self._graph_sig = None
+            self._embedding_cache = None
+            self._explainer = None
+            self._community_for_reasons = None
+            # The topology changed: old recommendations and pair-level reasons
+            # are stale (a candidate may even be a friend now). Drop both.
+            if self._rec_cache:
+                self._rec_cache.clear()
+                self.derived.save_recommendations(self._rec_cache)
+            if self._reason_pairs:
+                self._reason_pairs.clear()
+                self._persist_reasons()
+            self._reasons_dirty = True
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()
@@ -245,6 +277,8 @@ class SocialGraphService:
         self.store.save_users(users)
         # Invalidate recommendations since tags may change recommendations.
         self._rec_cache.pop(uid, None)
+        # Names/tags feed reason evidence -> invalidate the pair cache.
+        self._reasons_dirty = True
         return {"id": uid, **u}
 
     def delete_user(self, uid: int) -> bool:
@@ -373,6 +407,15 @@ class SocialGraphService:
             result["community_map"][str(node)] = int(comm)
         self._community_cache = result
         self._community_dirty = True
+        # Persist so that direct-from-disk reads (COMMUNITY_READ_DIRECT) and
+        # other processes see the same partition the reasons were built from.
+        self.derived.save_community(result)
+        self._community_for_reasons = None
+        self._explainer = None
+        # Community membership feeds "same community" evidence; the pair cache
+        # would otherwise keep stale claims after a re-partition.
+        self._reason_pairs.clear()
+        self._persist_reasons()
         return result
 
     def get_community(self) -> dict:
@@ -435,8 +478,106 @@ class SocialGraphService:
         }
 
     # ------------------------------------------------------------------
-    # Recommendations
+    # Recommendations + readable reasons (reasons.py is separate & reusable)
     # ------------------------------------------------------------------
+    def _community_int_map(self) -> Dict[int, int]:
+        """uid -> community id (ints), derived from the current cache/disk."""
+        if self._community_for_reasons is not None:
+            return self._community_for_reasons
+        raw = self.get_community().get("communities", {})
+        mapping: Dict[int, int] = {}
+        for node, comm in raw.items():
+            try:
+                mapping[int(node)] = int(comm)
+            except (TypeError, ValueError):
+                continue
+        self._community_for_reasons = mapping
+        return mapping
+
+    def _get_explainer(self) -> RecommendationExplainer:
+        """Build (or rebuild) the explainer against the current data snapshot."""
+        graph = self.get_graph()
+        users = self.store.load_users()
+        g_sig = self._graph_sig or reasons.graph_signature(graph)
+        u_sig = reasons.users_signature(users)
+        self._graph_sig = g_sig
+
+        # Stale pair cache means the graph/tag data changed on disk (another
+        # process, a fresh import, ...): every explanation must be rebuilt.
+        # ``_reasons_dirty`` covers same-process invalidation even when the
+        # previous signature was reset to an empty string.
+        if self._reasons_dirty or self._reason_graph_sig != g_sig or self._reason_users_sig != u_sig:
+            self._reason_pairs.clear()
+            # The explainer may hold a stale users dict / community map.
+            self._explainer = None
+        self._reason_graph_sig = g_sig
+        self._reason_users_sig = u_sig
+        self._reasons_dirty = False
+
+        if self._explainer is None:
+            self._explainer = RecommendationExplainer(
+                graph,
+                users,
+                communities=self._community_int_map(),
+                embeddings=self._get_embeddings(),
+            )
+        return self._explainer
+
+    def _get_embeddings(self) -> Dict[int, list]:
+        if self._embedding_cache is None:
+            graph = self.get_graph()
+            self._embedding_cache = algorithms.landmark_embedding(graph)
+        return self._embedding_cache
+
+    def _explain_pairs(self, pairs: List[Tuple[int, int]]) -> Dict[str, dict]:
+        """Explain pairs, reusing valid cached evidence."""
+        with self._lock:
+            explainer = self._get_explainer()
+            missing = [(u, c) for u, c in pairs if f"{u}:{c}" not in self._reason_pairs]
+            if missing:
+                for u, c in missing:
+                    record = explainer.explain(u, c)
+                    self._reason_pairs[f"{u}:{c}"] = record
+                self._prune_reason_pairs()
+                self._persist_reasons()
+            return {f"{u}:{c}": self._reason_pairs[f"{u}:{c}"] for u, c in pairs}
+
+    def _attach_reasons(self, user: int, items: List[dict]) -> List[dict]:
+        pairs = [(user, int(item["id"])) for item in items]
+        explanations = self._explain_pairs(pairs)
+        for item in items:
+            record = explanations.get(f"{user}:{item['id']}")
+            if record:
+                item["explanation"] = record
+                # Human-readable summary at top level too (backward-compatible
+                # consumers keep using the old signal-name ``reason``).
+                item["reason_text"] = record["reason_text"]
+                item["reason_type"] = record["primary_type"]
+        return items
+
+    def _prune_reason_pairs(self) -> None:
+        """Keep the reusable pair cache bounded (drop oldest-inserted first)."""
+        overflow = len(self._reason_pairs) - config.REASONS_CACHE_MAX_PAIRS
+        if overflow > 0:
+            for key in list(self._reason_pairs.keys())[:overflow]:
+                del self._reason_pairs[key]
+
+    def _persist_reasons(self) -> None:
+        self.derived.save_reasons(
+            self._reason_graph_sig, self._reason_users_sig, self._reason_pairs
+        )
+
+    def explain_recommendation(self, uid: int, candidate: int) -> dict:
+        """Standalone "why was this suggested?" -- same reusable path."""
+        graph = self.get_graph()
+        users = self.store.load_users()
+        # Cold-start users have a profile record but no graph node yet.
+        if uid not in users and not graph.has_node(uid):
+            return {"error": "目标用户不存在", "status": 404}
+        if candidate not in users and not graph.has_node(candidate):
+            return {"error": "候选用户不存在", "status": 404}
+        return self._explain_pairs([(uid, candidate)])[f"{uid}:{candidate}"]
+
     def recommend(self, uid: int, k: Optional[int] = None, refresh: bool = False, strategy: Optional[str] = None) -> dict:
         settings = self.settings.get()["recommendation"]
         requested_k = k or settings["k"]
@@ -450,8 +591,9 @@ class SocialGraphService:
         if not refresh and uid in self._rec_cache:
             cached = self._rec_cache[uid]
             result = dict(cached)
-            result["items"] = cached["items"][:k]
+            result["items"] = [dict(item) for item in cached["items"][:k]]
             result["cached"] = True
+            self._attach_reasons(uid, result["items"])
             return result
 
         graph = self.get_graph()
@@ -474,6 +616,8 @@ class SocialGraphService:
             {**item, "name": users.get(item["id"], {}).get("name", str(item["id"]))}
             for item in result["items"]
         ]
+        # Attach evidence-backed readable reasons (separate module, cached).
+        self._attach_reasons(uid, result["items"])
         # Cache at least k; store full list up to max k.
         self._rec_cache[uid] = result
         self.derived.save_recommendations(self._rec_cache)

@@ -27,6 +27,7 @@ Endpoint summary (all under ``/api``):
     POST   /api/community/compute     {resolution?}
     GET    /api/pagerank              ?top&refresh
     GET    /api/recommend/<id>        ?k&refresh&strategy
+    GET    /api/recommend/<id>/why/<candidate>  (evidence-backed reason)
     POST   /api/recommend             {ids:[...], k}
     GET    /api/stats
     GET    /api/settings              /  PUT /api/settings
@@ -316,6 +317,16 @@ class ApiRouter:
             for uid in ids:
                 result[str(uid)] = self.service.recommend(int(uid), k=k)["items"]
             return 200, {"results": result}
+
+        # --- standalone recommendation reason query ------------------------
+        m = re.fullmatch(r"/recommend/(\d+)/why/(\d+)", route)
+        if m and method == "GET":
+            uid = int(m.group(1))
+            candidate = int(m.group(2))
+            info = self.service.explain_recommendation(uid, candidate)
+            if info.get("status") == 404:
+                return _error(info["error"], 404)
+            return 200, info
 
         # --- stats ---
         if route == "/stats" and method == "GET":

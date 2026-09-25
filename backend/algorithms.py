@@ -695,9 +695,10 @@ def hybrid_recommend(
     diagnostics.
     """
     friends = list(graph.neighbors(user))
-    weighted_degree = 0
-    for _n, w in graph.neighbors_with_weights(user):
-        weighted_degree += int(w)
+    # Edge weights are fractional (seeded demo uses 0.5..1.0); summing them
+    # directly -- ``int(w)`` would truncate every edge to 0 and falsely mark
+    # every user as cold start.
+    weighted_degree = sum(w for _n, w in graph.neighbors_with_weights(user))
     if config.COLD_START_USE_WEIGHTED_DEGREE:
         degree = weighted_degree
     else:

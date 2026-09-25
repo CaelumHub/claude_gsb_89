@@ -394,6 +394,37 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .rec-info .meta { font-size: 12px; color: var(--text-muted); }
 .rec-score { font-family: var(--mono); font-size: 13px; color: var(--text-muted); white-space: nowrap; }
 
+/* 推荐可读理由（依据由后端 reasons.py 从真实图数据生成） */
+.reason-text {
+  margin: 5px 0 7px; font-size: 13px; line-height: 1.55; color: var(--text);
+}
+.reason-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.ev-chip { font-weight: 550; }
+.reason-evidence {
+  display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap;
+  margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border);
+}
+.evidence-cap {
+  flex: 0 0 auto; font-size: 11.5px; font-weight: 650; color: var(--text-faint);
+  padding-top: 3px; text-transform: uppercase; letter-spacing: 0.03em;
+}
+.reason-chains { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.reason-chain {
+  display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 12.5px;
+}
+.chain-node {
+  padding: 3px 9px; border-radius: 6px; background: var(--bg-inset);
+  color: var(--text); font-weight: 550;
+}
+.chain-node.is-me { background: var(--brand-soft); color: var(--brand-strong); }
+.chain-node.is-cand { background: var(--success-soft); color: var(--success); }
+.chain-arrow { color: var(--text-faint); font-size: 12px; }
+.chain-link { font-size: 12px; color: var(--brand); text-decoration: none; white-space: nowrap; }
+.chain-link:hover { text-decoration: underline; }
+.batch-reasons { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.batch-item { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
 /* 响应式侧栏 */
 @media (max-width: 860px) {
   #sidebar { position: fixed; z-index: 100; transform: translateX(-100%); transition: transform 0.2s; }
