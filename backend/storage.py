@@ -417,10 +417,37 @@ class DerivedStore:
                 v["items"] = items[: config.RECOMMEND_CLAMP_MAX]
         return recs
 
-    def save_recommendations(self, recs: Dict[int, dict]) -> None:
-        config.atomic_write_json(
-            config.RECOMMENDATIONS_FILE, {"recs": {str(k): v for k, v in recs.items()}}
+    def load_recommendations_bundle(self) -> dict:
+        """Load the full recommendation bundle (recs + cache version/fingerprint)."""
+        data = config.read_json(
+            config.RECOMMENDATIONS_FILE,
+            {"version": 0, "graph_signature": "", "recs": {}},
         )
+        data.setdefault("version", 0)
+        data.setdefault("graph_signature", "")
+        recs = {int(k): v for k, v in data.get("recs", {}).items()}
+        for v in recs.values():
+            if isinstance(v, dict) and isinstance(v.get("items"), list):
+                v["items"] = v["items"][: config.RECOMMEND_CLAMP_MAX]
+        data["recs"] = recs
+        return data
+
+    def save_recommendations(self, recs: Dict[int, dict]) -> None:
+        self.save_recommendations_bundle({"recs": recs})
+
+    def save_recommendations_bundle(self, bundle: dict) -> None:
+        """Persist recs together with a version and a graph-topology fingerprint.
+
+        The fingerprint (node/edge counts) lets a freshly started server reject
+        explanations cached against a different graph, so displayed evidence can
+        never reference edges/users that no longer exist.
+        """
+        payload = {
+            "version": config.REC_STORE_VERSION,
+            "graph_signature": bundle.get("graph_signature", ""),
+            "recs": {str(k): v for k, v in bundle.get("recs", {}).items()},
+        }
+        config.atomic_write_json(config.RECOMMENDATIONS_FILE, payload)
 
     def load_community(self) -> dict:
         data = config.read_json(config.COMMUNITY_FILE, {})

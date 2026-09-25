@@ -106,6 +106,18 @@ EXPORT_DEFAULT_WEIGHT = 0.0
 INDEX_EDGE_COUNT_INCLUDE_USERS = True
 
 # ---------------------------------------------------------------------------
+# Recommendation explanations (理由生成，与推荐计算解耦)
+# ---------------------------------------------------------------------------
+# 所有阈值只用于决定「是否声明」某条证据；声明的数值与 ID 全部来自真实图数据。
+EXPLAIN_STRONG_STRUCTURE_COSINE = 0.95   # ≥ 该余弦：结构位置高度相似（同簇均值≈0.98）
+EXPLAIN_WEAK_STRUCTURE_COSINE = 0.88     # ≥ 该余弦：结构位置较相似（跨簇均值≈0.84）
+EXPLAIN_POPULAR_RATIO = 1.5              # 候选度数 ≥ 全网平均度数 × 该倍数才算「高人气」
+EXPLAIN_POPULAR_MIN_DEGREE = 5           # 且至少拥有这么多好友，避免小图误报
+EXPLAIN_MAX_MUTUAL_FRIENDS = 3           # 关系链最多展示多少个共同好友
+EXPLAIN_MAX_SHARED_TAGS = 3              # 理由中最多列出多少个共同标签
+REC_STORE_VERSION = 2                    # 推荐缓存版本；图拓扑变更后旧版本缓存作废
+
+# ---------------------------------------------------------------------------
 # System settings defaults (persisted to settings.json, editable via UI)
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS = {

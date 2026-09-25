@@ -57,7 +57,23 @@ def _check() -> int:
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    # Recommendation explanations: independently derived from the graph, and
+    # every declared mutual friend must be adjacent to both endpoints.
+    from backend import explain
+    tags = {1: {"a"}, 2: {"a"}, 3: {"a"}, 4: {"a"}, 5: {"b"}, 6: {"b"}}
+    ev = explain.build_evidence(g, 1, 5, user_tags=tags)
+    assert ev is not None and ev["summary"]
+    for sig in ev["signals"]:
+        if sig["type"] == explain.SIGNAL_MUTUAL:
+            for fid in sig["mutual_friend_ids"]:
+                assert g.has_edge(1, fid) and g.has_edge(5, fid)
+    # Tags are shared only where the real tag sets intersect.
+    assert explain.build_evidence(g, 5, 6, user_tags=tags) is not None
+    assert "shared_tags" in [s["type"] for s in explain.build_evidence(g, 1, 2, user_tags=tags)["signals"]]
+    # Structured evidence renders to text on its own (evidence reuse).
+    assert explain.render_text(ev) == ev["summary"]
+
+    print("[check] OK: graph, bfs, pagerank, louvain, recommend, explain all pass")
     return 0
 
 
@@ -87,7 +103,7 @@ def main() -> int:
             result = seed.generate_demo(service)
             print(f"[social-graph] seeded {result['users']} users, {result['edges']} edges")
 
-    api.run(service)
+    api.run(service, host=config.HOST, port=config.PORT)
     return 0
 
 

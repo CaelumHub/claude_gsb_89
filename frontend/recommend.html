@@ -15,7 +15,7 @@
         <div class="page-head">
           <div>
             <h1>个性化推荐</h1>
-            <p class="desc">融合协同过滤、图嵌入与标签信号，经 MMR 多样性重排序；冷启动用户自动退化为热门 + 标签推荐。</p>
+            <p class="desc">融合协同过滤、图嵌入与标签信号，经 MMR 多样性重排序；每条推荐自动生成可读理由，关系链与数值依据均来自真实图数据。</p>
           </div>
         </div>
 
@@ -72,9 +72,56 @@
   <script>
     const C = common;
 
-    function reasonBadge(reason) {
-      const map = { "协同过滤": "brand", "图嵌入": "info", "标签": "success", "热门": "warning" };
-      return '<span class="badge ' + (map[reason] || "") + '">' + reason + "</span>";
+    const SIGNAL_META = {
+      mutual_friends: { badge: "brand", ico: "👥", text: "共同好友" },
+      shared_tags: { badge: "success", ico: "🏷", text: "标签重合" },
+      structural_similarity: { badge: "info", ico: "◈", text: "结构相似" },
+      popularity: { badge: "warning", ico: "★", text: "热门" },
+    };
+
+    function nameOf(id, ex) {
+      return (ex && ex.names && ex.names[String(id)]) || ("用户 " + id);
+    }
+
+    function signalBadge(sig) {
+      const meta = SIGNAL_META[sig.type] || { badge: "", ico: "•" };
+      return '<span class="badge ' + meta.badge + '">' + meta.ico + " " +
+             C.escapeHtml(sig.label || meta.text) + "</span>";
+    }
+
+    // 把证据中的一条 [user -> mutual -> candidate] 关系链渲染成可见的节点链。
+    function chainHtml(chain, ex) {
+      return chain.map((id) =>
+        '<span class="chain-node">' + C.escapeHtml(nameOf(id, ex)) +
+        '<span class="chain-id">#' + id + "</span></span>"
+      ).join('<span class="chain-arrow">→</span>');
+    }
+
+    function evidenceDetailHtml(ex) {
+      if (!ex || !ex.signals || !ex.signals.length) return "";
+      let html = '<div class="reason-detail">';
+      for (const sig of ex.signals) {
+        html += '<div class="reason-line"><span class="reason-line-badge">' + signalBadge(sig) + "</span><div>";
+        if (sig.type === "mutual_friends") {
+          html += '<div class="reason-chains">' +
+                  sig.chains.map((ch) => '<div class="chain">' + chainHtml(ch, ex) + "</div>").join("") +
+                  "</div>";
+        } else if (sig.type === "shared_tags") {
+          html += '<div class="reason-tags">' +
+                  sig.tags.map((t) => '<span class="tag-chip">' + C.escapeHtml(t) + "</span>").join("") +
+                  '<span class="faint small">（重合度 ' + (sig.overlap_ratio * 100).toFixed(0) + "%）</span></div>";
+        } else if (sig.type === "structural_similarity") {
+          html += '<div class="faint small">地标距离嵌入余弦相似度 <span class="mono">' +
+                  sig.cosine.toFixed(3) + "</span>" +
+                  (sig.strong ? ' · <strong>高度相似</strong>' : "") + "</div>";
+        } else if (sig.type === "popularity") {
+          html += '<div class="faint small">' + sig.degree + " 位好友 · 全网度数排名第 " +
+                  sig.rank + " / " + sig.total_users + "</div>";
+        }
+        html += "</div></div>";
+      }
+      html += "</div>";
+      return html;
     }
 
     function renderRec(r) {
@@ -88,14 +135,25 @@
 
       const box = document.getElementById("recList");
       if (!r.items.length) { box.innerHTML = C.emptyState("✦", "无可推荐对象（图可能太小或该用户已与所有人相连）"); return; }
-      box.innerHTML = r.items.map((it, i) =>
-        '<div class="rec-item">' +
-        '<div class="rec-rank' + (i < 3 ? " top" : "") + '">' + (i + 1) + "</div>" +
-        '<div class="rec-info"><div class="name">' + C.escapeHtml(it.name || ("用户 " + it.id)) + ' <span class="faint mono small">#' + it.id + "</span></div>" +
-        '<div class="meta">' + reasonBadge(it.reason) + "</div></div>" +
-        '<div class="rec-score">' + it.score.toFixed(4) + "</div>" +
-        "</div>"
-      ).join("");
+      box.innerHTML = r.items.map((it, i) => {
+        const ex = it.explanation;
+        const primary = ex && ex.primary_signal;
+        const meta = SIGNAL_META[primary] || { badge: "", ico: "✦" };
+        const summary = ex ? ex.summary : it.reason;
+        return '<div class="rec-item">' +
+          '<div class="rec-rank' + (i < 3 ? " top" : "") + '">' + (i + 1) + "</div>" +
+          '<div class="rec-info">' +
+            '<div class="name">' + C.escapeHtml(it.name || ("用户 " + it.id)) +
+            ' <span class="faint mono small">#' + it.id + "</span></div>" +
+            '<div class="reason-summary">' +
+              '<span class="badge ' + meta.badge + ' reason-why">' + meta.ico + " 为什么推荐</span>" +
+              '<span class="reason-text">' + C.escapeHtml(summary) + "</span>" +
+            "</div>" +
+            evidenceDetailHtml(ex) +
+          "</div>" +
+          '<div class="rec-score">' + it.score.toFixed(4) + "</div>" +
+        "</div>";
+      }).join("");
     }
 
     function recommend(uid, k, strategy) {
@@ -125,9 +183,19 @@
           let html = "";
           for (const uid of ids) {
             const items = results[String(uid)] || [];
-            html += '<div class="card" style="margin-bottom:10px;padding:14px"><strong>用户 ' + uid + "</strong>" +
-                    (items.length ? items.map((it) => '<span class="badge brand" style="margin-left:6px">' + (it.name || it.id) + "</span>").join("") : ' <span class="faint">无</span>') +
-                    "</div>";
+            html += '<div class="card batch-card"><strong>用户 ' + uid + "</strong>";
+            if (!items.length) {
+              html += ' <span class="faint">无推荐</span>';
+            } else {
+              html += items.map((it) => {
+                const ex = it.explanation;
+                const reason = ex ? ex.summary : it.reason;
+                return '<div class="batch-item"><span class="batch-name">' +
+                       C.escapeHtml(it.name || it.id) + " #" + it.id + "</span>" +
+                       '<span class="batch-reason">' + C.escapeHtml(reason) + "</span></div>";
+              }).join("");
+            }
+            html += "</div>";
           }
           box.innerHTML = html;
         }).catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });

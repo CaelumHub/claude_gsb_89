@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from . import algorithms, config, storage
+    from . import algorithms, config, explain, storage
     from .algorithms import (
         adamic_adar,
         bidirectional_shortest_path,
@@ -35,11 +35,13 @@ try:
         pagerank,
         shortest_path,
     )
+    from .explain import build_evidence, degree_ranking, get_embedding, graph_stats, hydrate_names
     from .graph import Graph
     from .storage import DerivedStore, GraphStore, rebuild_index_from_shards
 except ImportError:  # pragma: no cover
     import algorithms
     import config
+    import explain
     import storage
     from algorithms import (  # type: ignore
         adamic_adar,
@@ -52,6 +54,7 @@ except ImportError:  # pragma: no cover
         pagerank,
         shortest_path,
     )
+    from explain import build_evidence, degree_ranking, get_embedding, graph_stats, hydrate_names  # type: ignore
     from graph import Graph
     from storage import DerivedStore, GraphStore, rebuild_index_from_shards
 
@@ -70,9 +73,46 @@ class SocialGraphService:
         self._graph_dirty = False
         self._community_cache: Optional[dict] = None
         self._pagerank_cache: Optional[Dict[int, float]] = None
-        self._rec_cache: Dict[int, dict] = self.derived.load_recommendations()
+        self._embedding_cache: Optional[dict] = None  # landmark matrix for current graph
+        self._rec_cache: Dict[int, dict] = {}
+        self._rec_signature = ""
+        self._load_rec_cache()
         self._community_dirty = False
         self._pagerank_dirty = False
+
+    def _graph_signature(self) -> str:
+        """Cheap topology fingerprint: cached explanations must match it."""
+        meta = self.store.index.meta
+        return f"{meta.get('node_count', 0)}:{meta.get('edge_count', 0)}"
+
+    def _load_rec_cache(self) -> None:
+        """Load persisted recommendations, rejecting stale/missing explanations.
+
+        A bundle is accepted only when its format version is current AND its
+        graph fingerprint matches the on-disk index; otherwise every reason
+        would be regenerated from the live graph before display.
+        """
+        bundle = self.derived.load_recommendations_bundle()
+        signature = self._graph_signature()
+        if (
+            bundle.get("version") == config.REC_STORE_VERSION
+            and bundle.get("graph_signature") == signature
+        ):
+            self._rec_cache = bundle.get("recs", {})
+        else:
+            self._rec_cache = {}
+        self._rec_signature = signature
+
+    def _persist_rec_cache(self) -> None:
+        self.derived.save_recommendations_bundle({
+            "recs": self._rec_cache,
+            "graph_signature": self._graph_signature(),
+        })
+
+    def _clear_rec_cache(self) -> None:
+        """Drop all cached recommendations+explanations (graph/tag data changed)."""
+        self._rec_cache = {}
+        self._persist_rec_cache()
 
     # ------------------------------------------------------------------
     # Graph access / caching
@@ -83,10 +123,20 @@ class SocialGraphService:
             if self._graph is None or self._graph_dirty:
                 self._graph = self.store.load_full_graph()
                 self._graph_dirty = False
-                # Graph changed -> derived results are stale.
+                # A fresh graph invalidates every graph-derived cache,
+                # including recommendation explanations.
                 self._community_dirty = True
                 self._pagerank_dirty = True
+                self._embedding_cache = None
+                self._invalidate_recs_if_graph_changed()
             return self._graph
+
+    def _invalidate_recs_if_graph_changed(self) -> None:
+        """Drop recommendation caches whose fingerprint no longer matches."""
+        signature = self._graph_signature()
+        if signature != self._rec_signature:
+            self._rec_signature = signature
+            self._clear_rec_cache()
 
     def invalidate_graph(self) -> None:
         with self._lock:
@@ -94,6 +144,11 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+            self._embedding_cache = None
+            # Edges/users changed: all persisted reasons may cite vanished
+            # edges, so wipe both the in-memory and on-disk recommendation cache.
+            self._rec_signature = self._graph_signature()
+            self._clear_rec_cache()
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()
@@ -243,8 +298,12 @@ class SocialGraphService:
         if "attributes" in patch:
             u["attributes"] = {**u.get("attributes", {}), **patch["attributes"]}
         self.store.save_users(users)
-        # Invalidate recommendations since tags may change recommendations.
-        self._rec_cache.pop(uid, None)
+        # Tags feed shared-tag evidence for *every* user, so all cached
+        # recommendations (and their explanations) must be regenerated.
+        if "tags" in patch:
+            self._clear_rec_cache()
+        else:
+            self._rec_cache.pop(uid, None)
         return {"id": uid, **u}
 
     def delete_user(self, uid: int) -> bool:
@@ -260,6 +319,8 @@ class SocialGraphService:
             if u != uid and v != uid
         ]
         self._rewrite_all_edges(edges)
+        # _rewrite_all_edges -> invalidate_graph already wipes the rec cache;
+        # this also covers any cache keyed by the deleted user itself.
         self._rec_cache.pop(uid, None)
         return True
 
@@ -447,16 +508,24 @@ class SocialGraphService:
         diversity = config.DIVERSITY_LAMBDA
         use_tags = settings["useTags"]
 
-        if not refresh and uid in self._rec_cache:
-            cached = self._rec_cache[uid]
+        graph = self.get_graph()
+        users = self.store.load_users()
+
+        cached = None if refresh else self._rec_cache.get(uid)
+        # A cache is usable only if every item already carries structured
+        # evidence generated for the current graph; otherwise recompute.
+        if cached is not None and all(
+            isinstance(it, dict) and it.get("explanation") for it in cached.get("items", [])
+        ):
             result = dict(cached)
-            result["items"] = cached["items"][:k]
+            result["items"] = self._present_items(cached["items"][:k], users)
             result["cached"] = True
             return result
 
-        graph = self.get_graph()
-        users = self.store.load_users()
         user_tags = {u: set(v.get("tags", [])) for u, v in users.items()}
+        # One landmark matrix / degree ranking per request, shared by the
+        # embedding recommender and the explanation layer (same structural facts).
+        embedding, degree_rank, avg_degree = self._explanation_context(graph)
         with config.Timed() as timer:
             result = hybrid_recommend(
                 graph,
@@ -466,18 +535,92 @@ class SocialGraphService:
                 diversity=diversity,
                 use_tags=use_tags,
                 user_tags=user_tags,
+                embedding=embedding,
             )
         result["time_ms"] = round(timer.elapsed_ms, 2)
         result["cached"] = False
-        # Attach names for the UI.
-        result["items"] = [
-            {**item, "name": users.get(item["id"], {}).get("name", str(item["id"]))}
-            for item in result["items"]
-        ]
-        # Cache at least k; store full list up to max k.
+
+        # --- Explanations: a SEPARATE pass over the real graph --------------
+        # Recommendation scores never justify themselves; evidence is rebuilt
+        # independently from neighbour intersections, tags, the embedding and
+        # the degree sequence.
+        self._attach_explanations(
+            graph, uid, result["items"], user_tags, embedding, degree_rank, avg_degree
+        )
+
+        # Cache the structured evidence (IDs only); names are resolved on
+        # presentation so renames never stale the cached justification.
         self._rec_cache[uid] = result
-        self.derived.save_recommendations(self._rec_cache)
-        return result
+        self._persist_rec_cache()
+
+        presented = dict(result)
+        presented["items"] = self._present_items(result["items"], users)
+        return presented
+
+    def _explanation_context(self, graph: Graph):
+        """Return shared ``(embedding, degree_rank, avg_degree)`` for this graph."""
+        if self._embedding_cache is None:
+            self._embedding_cache = {}
+        ctx = self._embedding_cache
+        embedding = get_embedding(graph, ctx)
+        if "degree_rank" not in ctx:
+            ctx["degree_rank"] = degree_ranking(graph)
+        if "avg_degree" not in ctx:
+            ctx["avg_degree"] = graph_stats(graph)["avg_degree"]
+        return embedding, ctx["degree_rank"], ctx["avg_degree"]
+
+    def _attach_explanations(
+        self,
+        graph: Graph,
+        uid: int,
+        items: List[dict],
+        user_tags: Dict[int, Set[str]],
+        embedding: Optional[dict] = None,
+        degree_rank: Optional[Dict[int, int]] = None,
+        avg_degree: Optional[float] = None,
+    ) -> None:
+        """Attach an independent structured explanation to each recommended item."""
+        if embedding is None or degree_rank is None or avg_degree is None:
+            embedding, degree_rank, avg_degree = self._explanation_context(graph)
+        for item in items:
+            item["explanation"] = build_evidence(
+                graph, uid, item["id"], user_tags, embedding, degree_rank, avg_degree
+            )
+
+    def _present_items(self, items: List[dict], users: Dict[int, dict]) -> List[dict]:
+        """Resolve display names into cached evidence at response time."""
+        presented = []
+        for item in items:
+            out = dict(item)
+            cid = out.get("id")
+            out["name"] = users.get(cid, {}).get("name", str(cid))
+            evidence = out.get("explanation")
+            if evidence:
+                out["explanation"] = hydrate_names(evidence, users)
+            presented.append(out)
+        return presented
+
+    def explain_recommendation(self, uid: int, candidate_id: int) -> Optional[dict]:
+        """Generate the readable justification for one arbitrary pair.
+
+        Independent of the recommender — works even when the candidate was not
+        recommended — so the same evidence builder is reusable elsewhere.
+        """
+        graph = self.get_graph()
+        if not graph.has_node(uid) or not graph.has_node(candidate_id):
+            return None
+        users = self.store.load_users()
+        user_tags = {u: set(v.get("tags", [])) for u, v in users.items()}
+        embedding, degree_rank, avg_degree = self._explanation_context(graph)
+        evidence = build_evidence(
+            graph, uid, candidate_id, user_tags, embedding, degree_rank, avg_degree
+        )
+        if evidence is None:
+            return None
+        evidence = hydrate_names(evidence, users)
+        evidence["candidate_name"] = users.get(candidate_id, {}).get("name", str(candidate_id))
+        evidence["user_name"] = users.get(uid, {}).get("name", str(uid))
+        return evidence
 
     def recommend_many(self, uids: List[int], k: int = 10) -> dict:
         out = {}

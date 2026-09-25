@@ -490,6 +490,7 @@ def recommend_embedding(
     user: int,
     k: int,
     exclude: Optional[Set[int]] = None,
+    embedding: Optional[Dict[int, List[float]]] = None,
 ) -> List[Tuple[int, float, str]]:
     """Graph-embedding recommendation via landmark (positional) embeddings.
 
@@ -499,6 +500,10 @@ def recommend_embedding(
     recommending nearest neighbours in this embedding space surfaces
     *structurally similar* users -- not merely friends-of-friends -- which
     yields more diverse and non-obvious recommendations.
+
+    ``embedding`` may be supplied to reuse a landmark matrix computed by the
+    caller (e.g. the explanation layer), so the structural signal is computed
+    once and shared instead of recomputed per strategy.
 
     This is the scalable analogue of node2vec/DeepWalk without any neural
     training: ``num_landmarks`` bounded BFS passes give an O(L * (V+E)) runtime
@@ -510,7 +515,7 @@ def recommend_embedding(
     if n == 0 or not graph.has_node(user):
         return []
 
-    emb = landmark_embedding(graph)
+    emb = embedding if embedding is not None else landmark_embedding(graph)
     target = emb.get(user)
     if target is None:
         return []
@@ -687,12 +692,13 @@ def hybrid_recommend(
     diversity: float = config.DIVERSITY_LAMBDA,
     use_tags: bool = True,
     user_tags: Optional[Dict[int, Set[str]]] = None,
+    embedding: Optional[Dict[int, List[float]]] = None,
 ) -> Dict[str, object]:
     """Top-level recommender.
 
     Chooses a strategy, blends signals, then applies MMR diversity re-ranking.
     Returns a rich dict the API can serialise directly, including cold-start
-    diagnostics.
+    diagnostics.  ``embedding`` may reuse a caller-supplied landmark matrix.
     """
     friends = list(graph.neighbors(user))
     weighted_degree = 0
@@ -717,7 +723,7 @@ def hybrid_recommend(
     if strategy in ("cf", "hybrid"):
         _add(recommend_collaborative(graph, user, k * 4, exclude), 0.1)
     if strategy in ("embedding", "hybrid"):
-        _add(recommend_embedding(graph, user, k * 4, exclude), 0.1)
+        _add(recommend_embedding(graph, user, k * 4, exclude, embedding=embedding), 0.1)
     _add(recommend_popularity(graph, user, k * 4, exclude), 1.0)
     if use_tags and (strategy in ("hybrid",) or cold_start):
         _add(recommend_tag_based(graph, user, k * 4, user_tags, exclude), 5.0)

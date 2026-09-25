@@ -28,6 +28,7 @@ Endpoint summary (all under ``/api``):
     GET    /api/pagerank              ?top&refresh
     GET    /api/recommend/<id>        ?k&refresh&strategy
     POST   /api/recommend             {ids:[...], k}
+    GET    /api/recommend/<id>/explain/<candidate>  推荐理由（独立生成）
     GET    /api/stats
     GET    /api/settings              /  PUT /api/settings
     POST   /api/settings/reset
@@ -317,6 +318,22 @@ class ApiRouter:
                 result[str(uid)] = self.service.recommend(int(uid), k=k)["items"]
             return 200, {"results": result}
 
+        # --- recommendation explanation (independent of the recommender) ---
+        m = re.fullmatch(r"/recommend/(\d+)/explain/(\d+)", route)
+        if m and method == "GET":
+            uid, candidate_id = int(m.group(1)), int(m.group(2))
+            evidence = self.service.explain_recommendation(uid, candidate_id)
+            if evidence is None:
+                return _error("用户或候选对象不存在", 404)
+            return 200, evidence
+        m = re.fullmatch(r"/explain/(\d+)/(\d+)", route)
+        if m and method == "GET":
+            uid, candidate_id = int(m.group(1)), int(m.group(2))
+            evidence = self.service.explain_recommendation(uid, candidate_id)
+            if evidence is None:
+                return _error("用户或候选对象不存在", 404)
+            return 200, evidence
+
         # --- stats ---
         if route == "/stats" and method == "GET":
             return 200, self.service.full_stats()
@@ -562,10 +579,11 @@ def create_server(service: SocialGraphService, host: str = config.HOST, port: in
     return ThreadingHTTPServer((host, port), handler)
 
 
-def run(service: SocialGraphService) -> None:
+def run(service: SocialGraphService, host: Optional[str] = None, port: Optional[int] = None) -> None:
     config.ensure_dirs()
-    server = create_server(service)
-    print(f"[social-graph] serving on http://{config.HOST}:{config.PORT}")
+    server = create_server(service, host or config.HOST, port if port is not None else config.PORT)
+    bound_host, bound_port = server.server_address[:2]
+    print(f"[social-graph] serving on http://{bound_host}:{bound_port}")
     print(f"[social-graph] data dir: {config.DATA_DIR}")
     try:
         server.serve_forever()

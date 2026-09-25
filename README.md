@@ -45,6 +45,7 @@ gsb3/
 │   ├── config.py               # 配置、设置存储、路径、原子写工具
 │   ├── graph.py                # 内存高效 CSR 图（邻接表冻结为压缩数组）
 │   ├── algorithms.py           # BFS/双向BFS、PageRank、Louvain、推荐算法
+│   ├── explain.py              # 推荐理由生成（独立于推荐计算，证据可复用）
 │   ├── storage.py              # 分片 JSON 邻接表存储、索引、增量合并
 │   ├── service.py              # 业务服务层（缓存、CRUD、算法调度）
 │   ├── api.py                  # HTTP 服务 + REST 路由 + 静态托管
@@ -109,12 +110,32 @@ gsb3/
 | 图嵌入 | 距离-地标（landmark）定位嵌入：L 次有界 BFS 得到低维向量，捕捉结构相似性，无需神经网络训练 |
 | 冷启动 | 好友数低于阈值时退化为「热门 + 标签重叠」 |
 | 多样性 | MMR 最大边际相关性重排序，λ 权衡相关性与多样性 |
+| **推荐理由** | **理由生成与推荐计算解耦**：推荐结果产出后，由独立的 `explain.py` 重新审查真实图，按「共同好友 → 标签重合 → 结构位置相似 → 热门」组合可读理由，并输出可渲染为关系链的结构化证据 |
 
 ### 4. 数据分层
 
 图数据（分片邻接表）与派生数据（`recommendations.json` / `profiles.json` /
 `community.json` / `pagerank.json`）**分开存储**：图变更只触发图分片的增量写与索引
 刷新；推荐与社群结果作为缓存持久化，命中后零计算。
+
+### 5. 推荐理由（`explain.py`）
+
+每条推荐都带可读理由，且理由生成与推荐计算**完全分开**：`hybrid_recommend` 只决定
+「推荐谁」，随后 `explain.build_evidence` 独立重新审查真实图，决定「为什么」。
+
+- **结构化证据（依据可复用）**：返回纯数据的 `signals`——共同好友 ID 与二跳关系链
+  `chains`（如 `我 → 张三 → 候选`）、共同标签、地标嵌入余弦、候选度数/全网排名；
+  `render_text` 仅依据这些证据确定性地拼出中文句子，证据随推荐缓存持久化，可随时
+  重新渲染而无需再次访问图。
+- **与真实图一致、不虚构**：共同好友取邻接集交集并对每条边二次 `has_edge` 校验；
+  标签取自用户记录；结构相似度复用推荐所用的同一份地标嵌入；度数/排名取自真实度序列。
+  阈值只决定「是否提及」某信号（弱于阈值的结构相似直接省略），绝不编造数值；没有任何
+  证据时给出诚实的兜底文案。
+- **失效一致性**：`recommendations.json` 带格式版本与图指纹（节点/边计数）。导入边、
+  重建图、改标签后缓存整体作废并落盘清空，重启后指纹不匹配也会丢弃旧理由，避免展示
+  引用已删除边/用户的依据。缓存只存 ID，用户名在展示时 `hydrate_names` 填充，改名不
+  会让旧证据失真。
+- 前端 `recommend.html` 在每条推荐下用文字 + 关系链（`我 → 共同好友 → 候选`）呈现依据。
 
 ---
 
@@ -133,7 +154,8 @@ gsb3/
 | GET | `/api/path` · `/api/common-friends` | 最短路径 / 共同好友 |
 | GET/POST | `/api/community` · `/api/community/compute` | Louvain 结果 / 重算 |
 | GET | `/api/pagerank?top=` | PageRank 中心性 |
-| GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐 |
+| GET/POST | `/api/recommend/<id>` · `/api/recommend` | 单用户 / 批量推荐（含可读理由） |
+| GET | `/api/recommend/<id>/explain/<candidate>` | 任意用户对的推荐依据（独立生成，含关系链） |
 | GET | `/api/stats` | 统计面板聚合 |
 | GET/PUT | `/api/settings` | 读取 / 保存设置 |
 | GET/POST/DELETE | `/api/tags` | 标签管理 |
